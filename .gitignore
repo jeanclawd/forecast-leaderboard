@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.tmp
+.venv/
+# The backtest cache is a convenience for local re-analysis, not evidence.
+# Committing it would let a reader confuse cached numbers with attested ones.
+data/*/backtest_cache.json

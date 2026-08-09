@@ -1,0 +1,96 @@
+name: forecast tick
+
+# One tick per day. The three steps are committed SEPARATELY and in this
+# order on purpose — see CREDIBILITY.md. The forecast commit must be the last
+# one, so that the repository tree at that commit demonstrably contains no
+# observation for any period the commit predicts.
+
+on:
+  schedule:
+    - cron: "20 6 * * *" # 06:20 UTC, after the previous day has settled everywhere
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "restrict to one source id (blank = all)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: forecast-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: src
+      SOURCE_ARG: ${{ github.event.inputs.source && format('--source {0}', github.event.inputs.source) || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: the audit trail IS the product
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+        # No `pip install` step. The package is stdlib-only by design.
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ---------------------------------------------------------------- 1. observe
+      - name: Scrape new observations
+        run: python -m flb scrape $SOURCE_ARG
+
+      - name: Commit observations
+        run: |
+          git add data/*/observations.csv
+          git diff --staged --quiet && echo "no new observations" && exit 0
+          git commit -m "obs: settled periods as of $(date -u +%FT%TZ)"
+
+      # ---------------------------------------------------------------- 2. score
+      # Scoring happens BEFORE issuing anything new, so the scores commit can
+      # never be confused with the forecast commit it grades.
+      - name: Score forecasts whose outcome has now arrived
+        run: python -m flb score $SOURCE_ARG
+
+      - name: Commit scores
+        run: |
+          git add data/*/scores.csv site/index.html
+          git diff --staged --quiet && echo "nothing newly scorable" && exit 0
+          git commit -m "score: graded matured forecasts as of $(date -u +%FT%TZ)"
+
+      # ---------------------------------------------------------------- 3. predict
+      - name: Issue forecasts for periods that do not exist yet
+        run: python -m flb forecast $SOURCE_ARG
+
+      - name: Rebuild leaderboard
+        run: python -m flb build
+
+      - name: Commit forecasts (must be the final commit of the tick)
+        run: |
+          git add data/*/forecasts.csv site/index.html
+          git diff --staged --quiet && echo "no new forecasts" && exit 0
+          git commit -m "forecast: issued $(date -u +%FT%TZ) — outcome unknown at this commit"
+
+      - name: Push
+        run: git push
+
+      # Optional hardening, both off by default because they need setup.
+      # See CREDIBILITY.md § "What would actually harden this".
+      #
+      # - name: Anchor the commit hash in an external timestamp log
+      #   run: |
+      #     pip install opentimestamps-client
+      #     git rev-parse HEAD > .anchor/$(date -u +%F).sha
+      #     ots stamp .anchor/$(date -u +%F).sha
+      #     git add .anchor && git commit -m "anchor: ots stamp" && git push
+      #
+      # - name: Publish the leaderboard to GitHub Pages
+      #   uses: actions/upload-pages-artifact@v3
+      #   with:
+      #     path: site
