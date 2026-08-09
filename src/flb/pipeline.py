@@ -105,6 +105,13 @@ def forecast(source: Source, only: list[str] | None = None) -> int:
     last_day = parse_day(hist[-1][0])
 
     names = only or list(M.MODELS)
+    # A tick is idempotent: one forecast per model per day. Filter *before*
+    # calling anything, so a re-run of the workflow doesn't re-bill the FaaS
+    # for rows that will only be discarded.
+    names = [n for n in names if not all((today, n, t) in seen for t in future)]
+    if not names:
+        print("  already forecast today — nothing to do")
+        return 0
     if "tabicl" in names:
         M.warm()
 
