@@ -15,7 +15,7 @@ a skeptic checks that, and — at equal length — where the guarantee is weak.
 
 Generalises the pattern in [`yanndebray/git-scraping101`](https://github.com/yanndebray/git-scraping101)
 (scrape-and-commit) with the forecasting engine behind
-[tabcast](https://jean-clawd.com/tabcast/) (`api.tabicl.org`).
+tabcast (`api.tabicl.org`).
 
 ---
 
