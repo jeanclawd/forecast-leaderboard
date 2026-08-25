@@ -178,6 +178,165 @@ def _open_forecasts(source_id: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Forecasts-vs-outcomes chart: a self-contained inline SVG (no JS / CDN) that
+# lets a reader judge prediction quality at a glance — the actual series with
+# each model's forecasts overlaid, and TabICL's 80% band on the open forecast.
+# ---------------------------------------------------------------------------
+from datetime import date as _date
+
+# series colours chosen to read on both light and dark backgrounds
+_SERIES = {
+    "tabicl":         "#f0663f",
+    "seasonal_naive": "#3aa0ff",
+    "persistence":    "#8b7cff",
+    "climatology":    "#35b37e",
+}
+_MODEL_ORDER = ["tabicl", "seasonal_naive", "persistence", "climatology"]
+
+
+def _ord(ts: str) -> int:
+    return _date.fromisoformat(ts).toordinal()
+
+
+def _forecast_chart(sid: str, src) -> str:
+    obs = read_table(paths(sid)["obs"])
+    fc = read_table(paths(sid)["fc"])
+    if not obs or not fc:
+        return ""
+
+    obs_map = {r["timestamp"]: num(r["value"]) for r in obs if num(r["value"]) is not None}
+    last_obs = max(obs_map)
+
+    # window: from a little before the first live forecast to the last target
+    first_fc = min(r["issued_day"] for r in fc)
+    win_start = _date.fromisoformat(first_fc).toordinal() - 5
+    win_end = max(_ord(r["target_ts"]) for r in fc)
+
+    # actual series inside the window
+    actual = sorted(((_ord(t), v) for t, v in obs_map.items() if win_start <= _ord(t) <= win_end))
+    if len(actual) < 2:
+        return ""
+
+    # per-model h+1 "nowcast" overlaid on history (one forecast per target day)
+    nowcast = {m: {} for m in _MODEL_ORDER}
+    for r in fc:
+        if r["horizon"] == "1":
+            p = num(r["point"])
+            if p is not None and r["model"] in nowcast and _ord(r["target_ts"]) <= _ord(last_obs):
+                nowcast[r["model"]][_ord(r["target_ts"])] = p
+
+    # latest OPEN forecast (targets beyond the last observation) per model, all horizons
+    open_rows = [r for r in fc if _ord(r["target_ts"]) > _ord(last_obs)]
+    latest_day = max((r["issued_day"] for r in open_rows), default=None)
+    open_line = {m: [] for m in _MODEL_ORDER}
+    band = []  # tabicl q10/q90 ribbon
+    if latest_day:
+        for r in sorted(open_rows, key=lambda x: _ord(x["target_ts"])):
+            if r["issued_day"] != latest_day:
+                continue
+            p = num(r["point"])
+            if p is not None and r["model"] in open_line:
+                open_line[r["model"]].append((_ord(r["target_ts"]), p))
+            if r["model"] == "tabicl":
+                q10, q90 = num(r.get("0.1")), num(r.get("0.9"))
+                if q10 is not None and q90 is not None:
+                    band.append((_ord(r["target_ts"]), q10, q90))
+
+    # geometry
+    W, H = 760, 320
+    ml, mr, mt, mb = 42, 12, 28, 40
+    x0, x1 = win_start, win_end
+    ys = [v for _, v in actual]
+    for m in _MODEL_ORDER:
+        ys += list(nowcast[m].values()) + [v for _, v in open_line[m]]
+    for _, a, b in band:
+        ys += [a, b]
+    ymin, ymax = min(ys), max(ys)
+    pad = max(1.0, (ymax - ymin) * 0.08)
+    ymin, ymax = ymin - pad, ymax + pad
+
+    def px(o):
+        return ml + (o - x0) / max(1, (x1 - x0)) * (W - ml - mr)
+
+    def py(v):
+        return mt + (ymax - v) / (ymax - ymin) * (H - mt - mb)
+
+    def poly(pts, color, width=2, dash="", opacity=1.0):
+        if len(pts) < 2:
+            if len(pts) == 1:
+                o, v = pts[0]
+                return f'<circle cx="{px(o):.1f}" cy="{py(v):.1f}" r="2.6" fill="{color}"/>'
+            return ""
+        d = " ".join(f"{px(o):.1f},{py(v):.1f}" for o, v in pts)
+        da = f' stroke-dasharray="{dash}"' if dash else ""
+        return (f'<polyline points="{d}" fill="none" stroke="{color}" '
+                f'stroke-width="{width}" stroke-linejoin="round" stroke-linecap="round"'
+                f'{da} opacity="{opacity}"/>')
+
+    S = [f'<svg viewBox="0 0 {W} {H}" width="100%" style="max-width:100%;height:auto;'
+         'font:11px ui-sans-serif,system-ui,sans-serif" role="img" '
+         'aria-label="Forecasts versus observed outcomes">']
+
+    # y grid + labels
+    for i in range(5):
+        v = ymin + (ymax - ymin) * i / 4
+        y = py(v)
+        S.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{W-mr}" y2="{y:.1f}" '
+                 'stroke="var(--line)" stroke-width="1"/>')
+        S.append(f'<text x="{ml-6}" y="{y+3:.1f}" text-anchor="end" '
+                 f'fill="var(--mut)">{v:.0f}</text>')
+    # x date labels (start, boundary, end)
+    for o in (x0, _ord(last_obs), x1):
+        lbl = _date.fromordinal(o).isoformat()[5:]
+        S.append(f'<text x="{px(o):.1f}" y="{H-mb+16:.1f}" text-anchor="middle" '
+                 f'fill="var(--mut)">{lbl}</text>')
+    # "now" divider between observed and forecast
+    xb = px(_ord(last_obs))
+    S.append(f'<line x1="{xb:.1f}" y1="{mt}" x2="{xb:.1f}" y2="{H-mb}" '
+             'stroke="var(--mut)" stroke-width="1" stroke-dasharray="3 3" opacity="0.6"/>')
+    S.append(f'<text x="{xb-4:.1f}" y="{H-mb-6:.1f}" text-anchor="end" fill="var(--mut)" '
+             'style="font-size:10px">observed</text>')
+    S.append(f'<text x="{xb+4:.1f}" y="{H-mb-6:.1f}" text-anchor="start" fill="var(--mut)" '
+             'style="font-size:10px">forecast →</text>')
+
+    # tabicl 80% band on the open forecast
+    if band:
+        top = " ".join(f"{px(o):.1f},{py(hi):.1f}" for o, _, hi in band)
+        bot = " ".join(f"{px(o):.1f},{py(lo):.1f}" for o, lo, _ in reversed(band))
+        S.append(f'<polygon points="{top} {bot}" fill="{_SERIES["tabicl"]}" opacity="0.14"/>')
+
+    # baseline nowcasts (thin, muted)
+    for m in ("climatology", "persistence", "seasonal_naive"):
+        pts = sorted(nowcast[m].items())
+        S.append(poly(pts, _SERIES[m], width=1.4, opacity=0.7))
+        S.append(poly(open_line[m], _SERIES[m], width=1.4, dash="4 3", opacity=0.7))
+
+    # tabicl nowcast + open (highlighted)
+    S.append(poly(sorted(nowcast["tabicl"].items()), _SERIES["tabicl"], width=2.4))
+    S.append(poly(open_line["tabicl"], _SERIES["tabicl"], width=2.4, dash="5 3"))
+
+    # actual outcome line (dominant, on top)
+    S.append(poly(actual, "var(--fg)", width=2.6))
+    for o, v in actual:
+        S.append(f'<circle cx="{px(o):.1f}" cy="{py(v):.1f}" r="2.2" fill="var(--fg)"/>')
+
+    # legend
+    lx, ly = ml + 4, mt + 12
+    items = [("actual", "var(--fg)")] + [(m, _SERIES[m]) for m in _MODEL_ORDER]
+    for i, (lbl, col) in enumerate(items):
+        gx = lx + i * 112
+        S.append(f'<line x1="{gx}" y1="{ly}" x2="{gx+16}" y2="{ly}" stroke="{col}" stroke-width="3"/>')
+        S.append(f'<text x="{gx+21}" y="{ly+3.5}" fill="var(--mut)">{html.escape(lbl)}</text>')
+
+    S.append("</svg>")
+    dashed = "dashed = forecast for periods not yet observed"
+    return ('<div class="scroll" style="margin:.5rem 0 .25rem">' + "".join(S) + "</div>"
+            f'<p class="sub" style="margin:.15rem 0 0;font-size:.82rem">'
+            f'Actual daily outcome vs each model’s forecast (h+1 over history, full '
+            f'7-day horizon ahead of the divider; shaded = TabICL 80% interval). {dashed}.</p>')
+
+
 def build() -> str:
     parts = [
         f"<title>Forecast leaderboard</title><style>{CSS}</style>",
@@ -208,6 +367,10 @@ def build() -> str:
             "<div class=\"note\"><b>Sample size.</b> "
             f"{html.escape(enough_data(n_periods, n_origins))}</div>"
         )
+        chart = _forecast_chart(sid, src)
+        if chart:
+            parts.append("<h3>Forecasts vs outcomes</h3>")
+            parts.append(chart)
         parts.append("<h3>Live leaderboard — git-attested forecasts only</h3>")
         parts.append(_leaderboard_table(by_model) if by_model else "<p>Nothing scored yet.</p>")
         if by_model:
